@@ -1,0 +1,357 @@
+﻿AppType=JavaFX
+Build1=Default,b4j.example
+File1=Layout1.bjl
+FileGroup1=Default Group
+Group=Default Group
+Library1=jcore
+Library2=jfx
+Library3=mywebsocketclient
+Library4=jxmlsax
+Library5=xml2map
+Module1=cContentItem
+NumberOfFiles=1
+NumberOfLibraries=5
+NumberOfModules=1
+Version=8.1
+@EndOfDesignText@
+#Region Project Attributes 
+	#MainFormWidth: 600
+	#MainFormHeight: 600 
+#End Region
+	#AdditionalJar: Java-WebSocket-1.4.0-with-dependencies.jar
+
+Sub Process_Globals
+	Private fx As JFX
+	Private MainForm As Form
+	Private wsc As MyWebSocketClient
+	Private wsConnected As Boolean
+	
+	Dim mNavigation As Map
+	Dim mContent      As Map
+	Dim mContentMapID As Map
+	Dim CurMenuItem     As cContentItem
+	
+	Private TimerLuxWSRefresh As Timer
+
+	Private txtServer As TextField
+	Private txtPassword As TextField
+	Private txtPin As TextField
+	Private btnInfo As Button
+	Private btnEinstellungen As Button
+	Private cbxDumpMessages As CheckBox
+	Private cbxReconnect As CheckBox
+	Private tb1 As TableView
+	Private btnConnect As Button
+	Private txtRefreshTimer As TextField
+	Private cbkNavigation As ChoiceBox
+End Sub
+
+Sub AppStart (Form1 As Form, Args() As String)
+	MainForm = Form1
+	MainForm.RootPane.LoadLayout("Layout1")
+	MainForm.Show
+
+	txtServer.Text   = "ws://192.168.10.6:8214"
+	txtPassword.Text = "999999"
+	txtPin.Text      = "9445"
+
+	TimerLuxWSRefresh.Initialize("TimerLuxWSRefresh", 1000 * 5 )
+
+	tb1.SetColumns(Array As String("Name", "ID", "Value", "Key"))
+
+	mNavigation.Initialize
+	CurMenuItem.Initialize
+	mContent.Initialize
+	mContentMapID.Initialize
+End Sub
+
+'Return true to allow the default exceptions handler to handle the uncaught exception.
+Sub Application_Error (Error As Exception, StackTrace As String) As Boolean
+	Return True
+End Sub
+
+' Eigenheiten
+' Bei einen flaschen Request schließt die Luxtronik die Verbindung
+' Das kann sein GET; mit falscher ID oder ein Tippfehler wie GTE;
+
+Sub wsc_Open (o1 As Object)
+	Log("WSC Open")
+	wsConnected = True
+	btnConnect.Text = "Disconnect"
+	
+	btnEinstellungen.Enabled = True
+	btnInfo.Enabled = True
+	cbkNavigation.Enabled = True
+	wsc.SendText("LOGIN;" & txtPassword.Text.Trim)
+End Sub
+
+Sub wsc_Close (code As Int, reason As String, remote As Boolean)
+	Log($"Connection closed - ${code}-${reason}-${remote}"$)
+	wsc_DoDisconnect(remote)
+End Sub
+
+Sub wsc_Error
+	Log("Error " & LastException.Message)
+	wsc_DoDisconnect(True)
+End Sub
+
+Sub wsc_DoDisconnect(remote As Boolean)
+	wsConnected = False
+	
+	btnEinstellungen.Enabled = False
+	btnInfo.Enabled = False
+	cbkNavigation.Enabled = False
+	btnConnect.Text = "Connect"
+	
+	If cbxReconnect.Checked And remote Then
+		Sleep(5000)
+		LuxWSConnect
+	End If
+End Sub
+
+Sub wsc_Message (Message As String)
+	Log(Message)
+	Dim xml As Xml2Map
+	Dim m1 As Map
+	Dim attr As Map
+	Dim id As String
+
+	xml.Initialize
+	m1 = xml.Parse(Message)
+	
+	Dim ItemMap As Map
+	ItemMap.Initialize
+'	mNavigation.Clear
+	If m1.ContainsKey("Navigation") Then
+		DumpMessage(Message, "Navigation")
+		
+		m1 = m1.Get("Navigation")
+		attr = m1.Get("Attributes")
+		id = attr.Get("id")
+		Dim MenuItem As cContentItem
+		MenuItem.ID   = id
+		MenuItem.Name = "Navigation"
+		mNavigation.Put(MenuItem.Name, MenuItem)
+		ItemMap = LuxBuildFlatMap("", ItemMap, GetElements(m1, "item"), False)
+		mNavigation = ItemMap
+		Wait For (LuxInstallateur) Complete(Result As Boolean)
+		CallSubDelayed3(Me, "LuxWSGetContent", mNavigation.Get("Informationen"), True)
+		For Each k As String In mNavigation.Keys
+			cbkNavigation.Items.Add(k)
+		Next 		
+	Else If m1.ContainsKey("Content") Then
+		DumpMessage(Message, CurMenuItem.Name)
+		m1 = m1.Get("Content")
+		attr = m1.Get("Attributes")
+		ItemMap = LuxBuildFlatMap("", ItemMap, GetElements(m1, "item"), False)
+		mContent = ItemMap
+		mContentMapID.Clear
+		Dim MenuItem As cContentItem
+		For Each k As String In mContent.Keys
+			MenuItem = mContent.Get(k)
+			mContentMapID.Put(MenuItem.ID, k)
+		Next
+		CallSubDelayed(Me, "ContentLoaded")
+	else If m1.ContainsKey("values") Then
+		DumpMessage(Message, CurMenuItem.Name & "_values")
+		m1 = m1.Get("values")
+		ItemMap = LuxBuildFlatMap("", ItemMap, GetElements(m1, "item"), True)
+		
+		For Each k As String In ItemMap.Keys
+			Dim MenuItemNew As cContentItem
+			MenuItemNew = ItemMap.Get(k)
+			If mContentMapID.ContainsKey(k) Then
+				MenuItem = mContent.Get(mContentMapID.Get(k))
+				MenuItem.Value = MenuItemNew.Value
+				mContent.Put(mContentMapID.Get(k), MenuItem)
+			End If
+		Next
+	Else
+		DumpMessage(Message, "unkown")
+	End If
+	If mContent.Size>0 Then
+		tb1.Items.Clear
+		For Each k As String In mContent.Keys
+			Dim ContentItem As cContentItem = mContent.Get(k)
+			Dim row() As Object = CreateRow(Array As String(ContentItem.Name, ContentItem.ID, ContentItem.Value, k))
+			tb1.Items.Add(row)
+		Next
+	End If
+End Sub
+
+
+Sub CreateRow(Row() As String) As Object()
+	Dim labels(Row.Length) As Object
+	For i = 0 To Row.Length - 1
+		Dim lbl As Label
+		lbl.Initialize("")
+		lbl.Text = Row(i)
+		labels(i) = lbl
+	Next
+	Return labels
+End Sub
+
+Sub LuxWSGetContent(MenuItem As cContentItem, DoRefresh As Boolean)
+	If MenuItem = Null Then Return
+	If MenuItem.ID = Null Then Return
+	mContent.Clear
+	mContentMapID.Clear
+	wsc.SendText("GET;" & MenuItem.ID)
+	CurMenuItem = MenuItem
+	
+	TimerLuxWSRefresh.Enabled = False	' Reset Timer
+	TimerLuxWSRefresh.Enabled = DoRefresh
+End Sub
+
+Sub TimerLuxWSRefresh_Tick
+	If mContentMapID.Size = 0 Then Return ' No Page loaded
+	wsc.SendText("REFRESH")
+End Sub
+
+Sub LuxInstallateur As ResumableSub
+	'GET;0x320f10
+	'REFRESH
+	'SET;set_0x2eb92c;9445
+	'SAVE;1
+	
+	' Das Menü muss regelmäßig neugeladen werden da es sonst sein kann das man wieder Benutzer ist.
+	If mNavigation.ContainsKey("Zugang: Installateur") Then Return False ' Wir sind bereits Installateur
+	If mNavigation.ContainsKey("Zugang: Benutzer")=False Then
+		' Hier ist was falsch!
+		' Wir sind nicht Installateur oder Benutzer
+		LogError("Zugangsart konnte nicht bestimmt werden!")
+		Return False
+	End If
+	CallSubDelayed3(Me, "LuxWSGetContent", mNavigation.Get("Zugang: Benutzer"), False)
+	Wait For ContentLoaded 
+	
+
+	If mContent.ContainsKey("Passwort") Then
+		Dim ContentItem As cContentItem = mContent.Get("Passwort")
+		wsc.SendText("SET;set_" & ContentItem.ID &";" & txtPin.Text.Trim)
+		Sleep(500)
+		wsc.SendText("SAVE;1")
+	End If
+	Sleep(500)
+	CallSubDelayed3(Me, "LuxWSGetContent", CurMenuItem, True)
+	Return True
+End Sub
+
+
+Sub LuxBuildFlatMap(Prefix As String, ItemMap As Map, items As List, IdAsKey As Boolean) As Map
+	Dim idx      As Int
+	Dim Id       As String
+	Dim name     As String
+	Dim readonly As Boolean
+	Dim m1       As Map
+	Dim attr     As Map
+	Dim NewPrefix As String
+	If items.Size=0 Then Return ItemMap
+	
+	For idx=0 To items.Size - 1
+		m1 = items.Get(idx)
+		name = m1.Get("name")
+		attr = m1.Get("Attributes")
+		Id   = attr.Get("id")
+		If m1.ContainsKey("readOnly") And m1.Get("readOnly")="true" Then readonly = True Else readonly = False
+		If name.Contains("[") And name.Contains(",") Then
+			name = name.SubString(1)
+			name = name.SubString2(0, name.IndexOf(",")-1)
+			name = name.Trim
+		End If
+		
+		Dim MenuItem As cContentItem
+		MenuItem.ID       = Id
+		MenuItem.Name     = name
+		MenuItem.ReadOnly = readonly
+		If m1.ContainsKey("value") Then	MenuItem.Value = m1.Get("value")
+
+		If IdAsKey Then
+			ItemMap.Put(Id, MenuItem)
+		Else
+			ItemMap.Put(Prefix & MenuItem.Name, MenuItem)
+		End If
+		NewPrefix = Prefix & MenuItem.Name & "/"
+		
+		If m1.ContainsKey("item") Then ItemMap=LuxBuildFlatMap(NewPrefix, ItemMap, GetElements(m1, "item"), IdAsKey)
+	Next
+	Return ItemMap
+End Sub
+
+
+
+'Dim root As Map = ParsedData.Get("root")
+'For Each book As Map In GetElements(root, "book"))
+' Dim title As String = book.Get("title")
+'Next
+'Dim root As Map = ParsedData.Get("root")
+'For Each book As Map In root.Get("book")
+' Dim title As String = book.Get("title")
+'Next
+Sub GetElements (m As Map, key As String) As List
+	Dim res As List
+	If m.ContainsKey(key) = False Then
+		res.Initialize
+		Return res
+	Else
+		Dim value As Object = m.Get(key)
+		If value Is List Then Return value
+		res.Initialize
+		res.Add(value)
+		Return res
+	End If
+End Sub
+
+Sub DumpMessage(message As String, PageName As String)
+	Dim file1 As String
+	DateTime.DateFormat = "yyyyMMdd"
+	DateTime.TimeFormat = "HHmmss"
+	
+	If cbxDumpMessages.Checked Then
+		file1 = DateTime.Date(DateTime.Now) & "_" &DateTime.Time(DateTime.Now) & "_" & Rnd(0, 9999) & "_" & PageName & ".xml"
+		File.WriteString(File.DirApp, file1, message)
+	End If
+End Sub
+
+Sub btnConnect_Click
+	If wsConnected Then
+		TimerLuxWSRefresh.Enabled = False
+		wsc.Close
+	'	m1.Put("Sec-WebSocket-Protocol", "Lux_WS")
+	Else
+		LuxWSConnect
+	End If
+End Sub
+
+Sub LuxWSConnect
+	Dim m1 As Map
+	m1.Initialize
+	wsc.Initialize("wsc", txtServer.Text.Trim, m1, 5000)
+	wsc.Connect
+End Sub
+
+Sub btnInfo_Click
+	If wsConnected Then
+		CallSubDelayed3(Me, "LuxWSGetContent", mNavigation.Get("Informationen"), True)
+	End If
+End Sub
+
+Sub btnEinstellungen_Click
+	If wsConnected Then
+		CallSubDelayed3(Me, "LuxWSGetContent", mNavigation.Get("Einstellungen"), True)
+	End If
+End Sub
+
+Sub txtRefreshTimer_TextChanged (Old As String, New As String)
+	If New="" Then New="0"
+	If IsNumber(New) Then
+		TimerLuxWSRefresh.Interval = New * 1000
+	Else
+		txtRefreshTimer.Text = "5"
+	End If
+End Sub
+
+Sub cbkNavigation_SelectedIndexChanged(Index As Int, Value As Object)
+	Log(Value)
+	CallSubDelayed3(Me, "LuxWSGetContent", mNavigation.Get(Value), True)
+End Sub
